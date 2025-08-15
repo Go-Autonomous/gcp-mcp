@@ -20,6 +20,7 @@ import { BudgetServiceClient } from '@google-cloud/billing-budgets';
 import { ClusterManagerClient } from '@google-cloud/container';
 import { Logging, Entry, Log } from '@google-cloud/logging';
 import { SqlInstancesServiceClient } from '@google-cloud/sql';
+import { SearchServiceClient, protos } from '@google-cloud/discoveryengine'; // Import protos for type safety
 
 const codePrompt = `Your job is to answer questions about GCP environment by writing Javascript/TypeScript code using Google Cloud Client Libraries. The code must adhere to a few rules:
 - Must use promises and async/await
@@ -64,11 +65,39 @@ const server = new Server(
 
 let selectedProject: string | null = null;
 let selectedProjectCredentials: any = null;
-let selectedRegion: string = "us-central1";
+let selectedRegion: string = "europe-north1";
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      {
+        name: "search-confluence",
+        description: "Search for information in the company's Confluence pages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query to run against Confluence.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "search-drive",
+        description: "Search for company policies and documents in Google Drive.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The search query to run against Google Drive documents.",
+            },
+          },
+          required: ["query"],
+        },
+      },
       {
         name: "run-gcp-code",
         description: "Run GCP code",
@@ -213,6 +242,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+const SearchConfluenceSchema = z.object({
+  query: z.string(),
+});
+
+const SearchDriveSchema = z.object({
+  query: z.string(),
+});
+
 const RunGCPCodeSchema = z.object({
   reasoning: z.string(),
   code: z.string(),
@@ -345,7 +382,106 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       scopes: ['https://www.googleapis.com/auth/cloud-platform']
     });
 
-    if (name === "run-gcp-code") {
+    if (name === "search-confluence") {
+        const { query } = SearchConfluenceSchema.parse(args);
+        
+        if (!selectedProject) {
+            return createTextResponse("Error: No project selected. Please select a project first to use the connector.");
+        }
+
+        try {
+            const authClient = await auth.getClient();
+            const connectionName = `projects/${selectedProject}/locations/${selectedRegion}/connections/mcp-confluence-connection`;
+            const url = `https://connectors.googleapis.com/v1/${connectionName}:executeAction`;
+            const requestBody = {
+                action: 'search',
+                parameters: {
+                    cql: `text ~ "${query}"`
+                }
+            };
+            const response: any = await authClient.request({
+                url: url,
+                method: 'POST',
+                data: requestBody,
+            });
+
+            if (response.data && response.data.results && response.data.results.length > 0) {
+                const searchResults = JSON.parse(response.data.results[0].fields['json_data'].stringValue || '{}');
+                return createTextResponse(JSON.stringify(searchResults, null, 2));
+            } else {
+                return createTextResponse("No results found in Confluence.");
+            }
+        } catch (error: any) {
+            if (error.response) {
+                console.error('Error from API:', JSON.stringify(error.response.data, null, 2));
+            } else {
+                console.error('Error searching Confluence:', error.message);
+            }
+            return createTextResponse(`Error searching Confluence: ${error.message}`);
+        }
+
+    } else if (name === "search-drive") {
+        const { query } = SearchDriveSchema.parse(args);
+
+        if (!selectedProject) {
+            return createTextResponse("Error: No project selected. Please select a project first.");
+        }
+
+        try {
+            const searchClient = new SearchServiceClient();
+            const dataStoreId = "goautonomous-gdrive_1"; // The ID you provided
+            const location = "global"; // Vertex AI Search is a global service
+
+            const requestPayload = {
+                servingConfig: searchClient.projectLocationDataStoreServingConfigPath(
+                    selectedProject,
+                    location,
+                    dataStoreId,
+                    'default_config' // Use the default serving config
+                ),
+                query: query,
+                pageSize: 5 // Limit to 5 results to be concise
+            };
+            
+            // Explicitly define the type for the response tuple
+            type SearchResponseTuple = [
+                protos.google.cloud.discoveryengine.v1.ISearchResponse,
+                protos.google.cloud.discoveryengine.v1.ISearchRequest | undefined,
+                {} | undefined
+            ];
+
+            // The API returns a tuple [response, request, options].
+            const [responseObject] = await searchClient.search(requestPayload) as SearchResponseTuple;
+            
+            // Correctly access the 'results' property from the response object.
+            const searchResults = responseObject.results;
+
+            if (!searchResults || searchResults.length === 0) {
+                return createTextResponse("No results found in Google Drive.");
+            }
+
+            // Use the correct, more specific type for each result
+            const formattedResults = searchResults.map((result: protos.google.cloud.discoveryengine.v1.SearchResponse.ISearchResult) => {
+                const doc = result.document;
+                // Safely access potentially null or undefined values
+                const snippets = doc?.derivedStructData?.fields?.snippets?.listValue?.values;
+                const firstSnippet = (snippets && snippets.length > 0) ? snippets[0] : null;
+                const snippetText = firstSnippet?.structValue?.fields?.snippet?.stringValue;
+                
+                return {
+                    title: doc?.derivedStructData?.fields?.title?.stringValue || "No Title",
+                    link: doc?.derivedStructData?.fields?.link?.stringValue || "No Link",
+                    snippet: snippetText || "No snippet available."
+                };
+            });
+
+            return createTextResponse(JSON.stringify(formattedResults, null, 2));
+
+        } catch (error: any) {
+            console.error('Error searching Google Drive:', error);
+            return createTextResponse(`Error searching Google Drive: ${error.message}`);
+        }
+    } else if (name === "run-gcp-code") {
       const { reasoning, code, projectId, region } = RunGCPCodeSchema.parse(args);
       
       if (!selectedProject && !projectId) {
@@ -708,4 +844,55 @@ startServer();
 
 const createTextResponse = (text: string) => ({
   content: [{ type: "text", text }],
-}); 
+});
+
+
+Server.js
+const express = require('express');
+const { spawn } = require('child_process');
+const app = express();
+
+// Use a raw body parser to pass the request body directly to the child process
+app.use(express.raw({ type: '*/*' }));
+
+// The port to listen on, provided by Cloud Run or defaulting to 8080
+const port = process.env.PORT || 8080;
+
+app.post('/', (req, res) => {
+  // Spawn the original MCP server command as a child process
+  // This is the equivalent of running 'node bin.js' in the terminal
+  const mcpProcess = spawn('node', ['bin.js']);
+
+  let output = '';
+  let errorOutput = '';
+
+  // Capture the standard output from the MCP process
+  mcpProcess.stdout.on('data', (data) => {
+    output += data.toString();
+  });
+
+  // Capture any errors from the MCP process
+  mcpProcess.stderr.on('data', (data) => {
+    console.error(`MCP stderr: ${data}`);
+    errorOutput += data.toString();
+  });
+
+  // When the MCP process finishes, send its output as the HTTP response
+  mcpProcess.on('close', (code) => {
+    console.log(`MCP process exited with code ${code}`);
+    if (code !== 0) {
+      // If there was an error, return a server error status
+      return res.status(500).send(`MCP process failed:\n${errorOutput}`);
+    }
+    // Otherwise, send the successful output
+    res.status(200).send(output);
+  });
+
+  // Send the incoming HTTP request body to the MCP process's standard input
+  mcpProcess.stdin.write(req.body);
+  mcpProcess.stdin.end();
+});
+
+app.listen(port, () => {
+  console.log(`Wrapper server listening on port ${port}`);
+});
